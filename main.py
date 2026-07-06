@@ -65,6 +65,46 @@ def _get_recent_filings_raw(ticker: str, filing_type: str, limit: int) -> list[d
     return results
 
 
+def _extract_snippets(url: str, query: str, max_snippets: int = 3, context_chars: int = 250) -> list[str]:
+    """Fetch a filing document and extract short text snippets around keyword matches."""
+    try:
+        r = httpx.get(url, headers=SEC_HEADERS, timeout=20.0)
+        r.raise_for_status()
+    except Exception:
+        return []
+    try:
+        soup = BeautifulSoup(r.text, "lxml")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+        text = re.sub(r"\s+", " ", text)
+    except Exception:
+        return []
+    clean_query = query.strip('"').strip()
+    if not clean_query:
+        return []
+    matches = list(re.finditer(re.escape(clean_query), text, re.IGNORECASE))
+    if not matches:
+        return []
+    snippets = []
+    last_end = -1
+    for m in matches:
+        if m.start() < last_end + context_chars:
+            continue
+        start = max(0, m.start() - context_chars)
+        end = min(len(text), m.end() + context_chars)
+        last_end = end
+        snippet = text[start:end].strip()
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(text):
+            snippet = snippet + "..."
+        snippets.append(snippet)
+        if len(snippets) >= max_snippets:
+            break
+    return snippets
+
+
 @mcp.tool()
 def ticker_to_cik(ticker: str) -> dict:
     """Resolve a US stock ticker to its SEC Central Index Key (CIK)."""
@@ -120,7 +160,6 @@ def get_company_facts(ticker: str, concepts: list[str] | None = None, years: int
     return result
 
 
-# Strict patterns: require the section TITLE to follow "Item X"
 ITEM_START_PATTERNS = {
     "business": r"item\s*1\.\s*business",
     "risk_factors": r"item\s*1a\.?\s*risk\s*factors",
@@ -128,7 +167,6 @@ ITEM_START_PATTERNS = {
     "financial_statements": r"item\s*8\.?\s*financial\s*statements",
 }
 
-# Terminate on the SPECIFIC next section, not any Item X cross-reference
 NEXT_SECTION_PATTERNS = {
     "business": r"item\s*1a\b",
     "risk_factors": r"item\s*(1b|2)\b",
@@ -146,17 +184,8 @@ def get_10k_section(
 ) -> dict:
     """Extract a specific text section from a company's 10-K filing.
 
-    Sections:
-    - "business" (Item 1)
-    - "risk_factors" (Item 1A)
-    - "mda" (Item 7 - Management's Discussion & Analysis)
-    - "financial_statements" (Item 8)
-
-    Args:
-        ticker: US stock ticker.
-        section: Which section to extract.
-        accession_number: Specific 10-K accession to pull from. If None, uses the most recent.
-        max_chars: Maximum characters to return.
+    Sections: "business" (Item 1), "risk_factors" (Item 1A),
+    "mda" (Item 7), "financial_statements" (Item 8).
     """
     if section not in ITEM_START_PATTERNS:
         raise ValueError(f"Section '{section}' not supported. Options: {list(ITEM_START_PATTERNS.keys())}")
@@ -174,7 +203,6 @@ def get_10k_section(
 
     r = httpx.get(document_url, headers=SEC_HEADERS, timeout=30.0)
     r.raise_for_status()
-
     soup = BeautifulSoup(r.text, "lxml")
     for tag in soup(["script", "style"]):
         tag.decompose()
@@ -185,8 +213,6 @@ def get_10k_section(
     matches = list(re.finditer(start_pat, text, re.IGNORECASE))
     if not matches:
         raise ValueError(f"Section '{section}' marker not found in filing")
-
-    # Strict pattern: TOC and actual section header. Last match = actual section.
     start_match = matches[-1]
     start = start_match.end()
 
@@ -207,6 +233,100 @@ def get_10k_section(
         "text": extracted,
         "char_count": len(extracted),
         "document_url": document_url,
+    }
+
+
+@mcp.tool()
+def search_full_text(
+    query: str,
+    ticker: str | None = None,
+    forms: list[str] | None = None,
+    limit: int = 10,
+    with_snippets: bool = True,
+) -> dict:
+    """Full-text search across all SEC EDGAR filings.
+
+    Powered by SEC's EDGAR search index. Supports exact phrases (double quotes)
+    and boolean operators (AND, OR, NOT).
+
+    When with_snippets=True (default), fetches the top 3 filings to extract
+    text snippets around keyword matches — slower (~10-20s) but shows context.
+    Set with_snippets=False for fast metadata-only search.
+
+    Args:
+        query: Search string. Examples: 'generative AI', '"AI capex"', 'TikTok AND competition'.
+        ticker: Optional US stock ticker to limit search to one company.
+        forms: Optional list of filing forms (e.g. ["10-K", "10-Q"]).
+        limit: Maximum number of results. Default 10.
+        with_snippets: If True, fetch top 3 filings for snippet extraction.
+
+    Returns:
+        Dict with `query`, `total_hits`, and `results`.
+    """
+    params: dict = {"q": query}
+    if forms:
+        params["forms"] = ",".join(forms)
+    if ticker:
+        cik_info = _get_cik(ticker)
+        params["ciks"] = str(int(cik_info["cik"]))
+
+    r = httpx.get(
+        "https://efts.sec.gov/LATEST/search-index",
+        params=params,
+        headers=SEC_HEADERS,
+        timeout=20.0,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    hits = data.get("hits", {})
+    total_field = hits.get("total")
+    if isinstance(total_field, dict):
+        total = total_field.get("value", 0)
+    else:
+        total = total_field or 0
+    results_raw = hits.get("hits", [])[:limit]
+
+    snippet_budget = 3
+    results = []
+    for idx, hit in enumerate(results_raw):
+        src = hit.get("_source", {})
+        adsh = src.get("adsh", "") or ""
+        ciks = src.get("ciks", []) or []
+        cik_int = int(ciks[0]) if ciks else None
+        acc_no_dashes = adsh.replace("-", "") if adsh else ""
+
+        hit_id = src.get("id", "") or hit.get("_id", "")
+        primary_doc_url = None
+        if ":" in hit_id and cik_int and acc_no_dashes:
+            filename = hit_id.split(":", 1)[1]
+            primary_doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no_dashes}/{filename}"
+
+        filing_index_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no_dashes}/"
+            if cik_int and acc_no_dashes else None
+        )
+
+        snippets: list[str] = []
+        if with_snippets and primary_doc_url and idx < snippet_budget:
+            snippets = _extract_snippets(primary_doc_url, query)
+
+        results.append({
+            "form": src.get("form"),
+            "filed_date": src.get("file_date"),
+            "accession_number": adsh,
+            "company_name": (src.get("display_names") or [None])[0],
+            "cik": ciks[0] if ciks else None,
+            "filing_index_url": filing_index_url,
+            "primary_document_url": primary_doc_url,
+            "snippets": snippets,
+            "relevance_score": hit.get("_score"),
+        })
+
+    return {
+        "query": query,
+        "total_hits": total,
+        "results": results,
     }
 
 
